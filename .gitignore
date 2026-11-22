@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+checkpoints.db
 # Cloned repos (analysis targets)
 repos/
 

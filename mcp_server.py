@@ -12,6 +12,7 @@ from mcp.server.fastmcp import FastMCP
 import repo_tools
 
 mcp = FastMCP("repo-analyst-tools")
+_read_files: set[str] = set()   # remembers what's been read this session
 
 
 def _repo() -> Path:
@@ -31,7 +32,13 @@ def list_files(subpath: str = "") -> list[str]:
 @mcp.tool()
 def read_file(file_path: str) -> str:
     """Read the full contents of a single file in the repository, given its path like 'src/api.py'."""
-    return repo_tools.read_file(_repo(), file_path)
+    if file_path in _read_files:
+        return (f"[You already read '{file_path}' earlier this session. Its contents are "
+                "in your message history above — use those instead of re-reading.]")
+    content = repo_tools.read_file(_repo(), file_path)
+    _read_files.add(file_path)
+    return content
+   
 
 
 @mcp.tool()

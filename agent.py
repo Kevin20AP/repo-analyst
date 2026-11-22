@@ -1,15 +1,18 @@
 import asyncio
 import os
+import uuid
 from typing import Annotated, TypedDict
 
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_mcp_adapters.tools import load_mcp_tools        # NEW import
+from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
+from langgraph.types import interrupt, Command                       # NEW
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver          # NEW
 
 load_dotenv()
 
@@ -34,29 +37,80 @@ Be efficient: read only what you need to understand the project well."""
 
 class State(TypedDict):
     messages: Annotated[list, add_messages]
+    steps: int
+    approved: bool                              # NEW: did the human approve the report?
 
 
-# CHANGE 1: build_graph now takes the tools as an argument (no MCP work inside).
-def build_graph(tools):
-    model = ChatAnthropic(model=MODEL, max_tokens=4096).bind_tools(tools)
+def _text(content):
+    """Pull plain text out of a message's content (handles str or list-of-blocks)."""
+    if isinstance(content, str):
+        return content
+    return "".join(b.get("text", "") for b in content
+                   if isinstance(b, dict) and b.get("type") == "text")
+
+
+def build_graph(tools, checkpointer):            # NEW: takes a checkpointer
+    model_with_tools = ChatAnthropic(model=MODEL, max_tokens=4096).bind_tools(tools)
+    model_plain = ChatAnthropic(model=MODEL, max_tokens=4096)
+
+    MAX_STEPS = 15
+    WARN_STEP = 10
 
     async def agent_node(state: State):
-        response = await model.ainvoke(state["messages"])
-        return {"messages": [response]}
+        steps = state.get("steps", 0) + 1
+        messages = state["messages"]
+
+        if steps >= MAX_STEPS:
+            nudge = HumanMessage(content=(
+                "You've reached your exploration budget. Do NOT call any more tools. "
+                "Write the final analysis report now using what you've already read."
+            ))
+            response = await model_plain.ainvoke(messages + [nudge])
+            return {"messages": [response], "steps": steps}
+
+        if steps == WARN_STEP:
+            nudge = HumanMessage(content=(
+                "You're past half your exploration budget. Read only what's still "
+                "essential, then write the report soon."
+            ))
+            response = await model_with_tools.ainvoke(messages + [nudge])
+            return {"messages": [response], "steps": steps}
+
+        response = await model_with_tools.ainvoke(messages)
+        return {"messages": [response], "steps": steps}
 
     def should_continue(state: State):
         last = state["messages"][-1]
         if getattr(last, "tool_calls", None):
             return "tools"
-        return END
+        return "human_review"                    # CHANGED: go to review instead of END
+
+    # NEW NODE: pause and let a human approve or request revisions.
+    def human_review(state: State):
+        draft = _text(state["messages"][-1].content)
+        decision = interrupt({                   # <-- pauses the graph here
+            "draft_report": draft,
+            "instructions": "Reply 'approve' to accept, or type feedback to revise the report.",
+        })
+        if str(decision).strip().lower() == "approve":
+            return {"approved": True}
+        return {
+            "approved": False,
+            "messages": [HumanMessage(content=f"Please revise the report based on this feedback: {decision}")],
+        }
+
+    def after_review(state: State):
+        return END if state.get("approved") else "agent"
 
     graph = StateGraph(State)
     graph.add_node("agent", agent_node)
     graph.add_node("tools", ToolNode(tools))
+    graph.add_node("human_review", human_review)         # NEW
     graph.add_edge(START, "agent")
     graph.add_conditional_edges("agent", should_continue)
     graph.add_edge("tools", "agent")
-    return graph.compile()
+    graph.add_conditional_edges("human_review", after_review)   # NEW
+    return graph.compile(checkpointer=checkpointer)      # NEW: durability
 
 
 async def main():
@@ -69,19 +123,36 @@ async def main():
         }
     })
 
-    # CHANGE 2: open ONE persistent session and run the whole agent inside it.
     async with client.session("repo") as session:
-        tools = await load_mcp_tools(session)   # CHANGE 3: load tools bound to this open session
-        app = build_graph(tools)
-        result = await app.ainvoke(
-            {"messages": [SystemMessage(content=SYSTEM_PROMPT),
-                          HumanMessage(content="Analyze this repository.")]},
-            config={"recursion_limit": 30},
-        )
+        tools = await load_mcp_tools(session)
 
-    print("\n" + "=" * 60 + "\nAGENT TRAJECTORY\n" + "=" * 60)
-    for m in result["messages"]:
-        m.pretty_print()
+        # NEW: a durable checkpointer backed by SQLite.
+        async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as checkpointer:
+            app = build_graph(tools, checkpointer)
+
+            # thread_id identifies this run so its state can be saved/resumed.
+            config = {"configurable": {"thread_id": str(uuid.uuid4())},
+                      "recursion_limit": 50}
+
+            result = await app.ainvoke(
+                {"messages": [SystemMessage(content=SYSTEM_PROMPT),
+                              HumanMessage(content="Analyze this repository.")],
+                 "steps": 0, "approved": False},
+                config=config,
+            )
+
+            # HUMAN-IN-THE-LOOP: keep handling review pauses until approved.
+            while "__interrupt__" in result:
+                payload = result["__interrupt__"][0].value
+                print("\n" + "=" * 60)
+                print("DRAFT REPORT FOR YOUR REVIEW:\n")
+                print(payload["draft_report"])
+                print("\n" + payload["instructions"])
+                decision = input("\nYour response > ")
+                result = await app.ainvoke(Command(resume=decision), config=config)   # resume
+
+            print("\n" + "=" * 60 + "\nAPPROVED — FINAL REPORT\n" + "=" * 60)
+            print(_text(result["messages"][-1].content))
 
 
 asyncio.run(main())
