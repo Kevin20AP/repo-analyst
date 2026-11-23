@@ -11,8 +11,8 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from langgraph.types import interrupt, Command                       # NEW
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver          # NEW
+from langgraph.types import interrupt, Command
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 load_dotenv()
 
@@ -38,7 +38,7 @@ Be efficient: read only what you need to understand the project well."""
 class State(TypedDict):
     messages: Annotated[list, add_messages]
     steps: int
-    approved: bool                              # NEW: did the human approve the report?
+    approved: bool
 
 
 def _text(content):
@@ -49,7 +49,7 @@ def _text(content):
                    if isinstance(b, dict) and b.get("type") == "text")
 
 
-def build_graph(tools, checkpointer):            # NEW: takes a checkpointer
+def build_graph(tools, checkpointer):
     model_with_tools = ChatAnthropic(model=MODEL, max_tokens=4096).bind_tools(tools)
     model_plain = ChatAnthropic(model=MODEL, max_tokens=4096)
 
@@ -83,12 +83,25 @@ def build_graph(tools, checkpointer):            # NEW: takes a checkpointer
         last = state["messages"][-1]
         if getattr(last, "tool_calls", None):
             return "tools"
-        return "human_review"                    # CHANGED: go to review instead of END
+        return "reflect"
 
-    # NEW NODE: pause and let a human approve or request revisions.
+    async def reflect(state: State):
+        critique_prompt = HumanMessage(content=(
+            "Before finalizing, critically review your draft report above against the "
+            "files you actually read:\n"
+            "1. Are ALL claims supported by code you saw? Remove or soften anything you "
+            "guessed or inferred without evidence.\n"
+            "2. Is anything important missing (key components, real risks)?\n"
+            "3. Is it clear, specific, and well-organized?\n"
+            "Then rewrite it as an improved FINAL report that fixes these issues. "
+            "Output ONLY the improved report."
+        ))
+        response = await model_plain.ainvoke(state["messages"] + [critique_prompt])
+        return {"messages": [response]}
+
     def human_review(state: State):
         draft = _text(state["messages"][-1].content)
-        decision = interrupt({                   # <-- pauses the graph here
+        decision = interrupt({
             "draft_report": draft,
             "instructions": "Reply 'approve' to accept, or type feedback to revise the report.",
         })
@@ -105,12 +118,14 @@ def build_graph(tools, checkpointer):            # NEW: takes a checkpointer
     graph = StateGraph(State)
     graph.add_node("agent", agent_node)
     graph.add_node("tools", ToolNode(tools))
-    graph.add_node("human_review", human_review)         # NEW
+    graph.add_node("reflect", reflect)
+    graph.add_node("human_review", human_review)
     graph.add_edge(START, "agent")
     graph.add_conditional_edges("agent", should_continue)
     graph.add_edge("tools", "agent")
-    graph.add_conditional_edges("human_review", after_review)   # NEW
-    return graph.compile(checkpointer=checkpointer)      # NEW: durability
+    graph.add_edge("reflect", "human_review")
+    graph.add_conditional_edges("human_review", after_review)
+    return graph.compile(checkpointer=checkpointer)
 
 
 async def main():
@@ -126,11 +141,8 @@ async def main():
     async with client.session("repo") as session:
         tools = await load_mcp_tools(session)
 
-        # NEW: a durable checkpointer backed by SQLite.
         async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as checkpointer:
             app = build_graph(tools, checkpointer)
-
-            # thread_id identifies this run so its state can be saved/resumed.
             config = {"configurable": {"thread_id": str(uuid.uuid4())},
                       "recursion_limit": 50}
 
@@ -141,7 +153,6 @@ async def main():
                 config=config,
             )
 
-            # HUMAN-IN-THE-LOOP: keep handling review pauses until approved.
             while "__interrupt__" in result:
                 payload = result["__interrupt__"][0].value
                 print("\n" + "=" * 60)
@@ -149,10 +160,11 @@ async def main():
                 print(payload["draft_report"])
                 print("\n" + payload["instructions"])
                 decision = input("\nYour response > ")
-                result = await app.ainvoke(Command(resume=decision), config=config)   # resume
+                result = await app.ainvoke(Command(resume=decision), config=config)
 
             print("\n" + "=" * 60 + "\nAPPROVED — FINAL REPORT\n" + "=" * 60)
             print(_text(result["messages"][-1].content))
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
