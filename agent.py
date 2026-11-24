@@ -50,8 +50,8 @@ def _text(content):
 
 
 def build_graph(tools, checkpointer):
-    model_with_tools = ChatAnthropic(model=MODEL, max_tokens=4096).bind_tools(tools)
-    model_plain = ChatAnthropic(model=MODEL, max_tokens=4096)
+    model_with_tools = ChatAnthropic(model=MODEL, max_tokens=8000).bind_tools(tools)
+    model_plain = ChatAnthropic(model=MODEL, max_tokens=8000)
 
     MAX_STEPS = 15
     WARN_STEP = 10
